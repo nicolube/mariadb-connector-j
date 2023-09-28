@@ -315,6 +315,7 @@ public final class ConnectionHelper {
       byte[] fingerPrint,
       Credential credential,
       final byte[] seed) {
+    if (validationHash.length == 0) return false;
     try {
       assert (validationHash[0] == 0x01); // SHA256 encryption
 
