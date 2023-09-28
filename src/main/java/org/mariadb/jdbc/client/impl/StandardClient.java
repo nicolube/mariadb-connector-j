@@ -4,9 +4,14 @@
 
 package org.mariadb.jdbc.client.impl;
 
+import static org.mariadb.jdbc.client.impl.ConnectionHelper.enabledSslCipherSuites;
+import static org.mariadb.jdbc.client.impl.ConnectionHelper.enabledSslProtocolSuites;
+
 import java.io.*;
 import java.net.Socket;
 import java.net.SocketException;
+import java.security.KeyManagementException;
+import java.security.NoSuchAlgorithmException;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.SQLNonTransientConnectionException;
@@ -18,7 +23,7 @@ import java.util.*;
 import java.util.concurrent.Executor;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.stream.Collectors;
-import javax.net.ssl.SSLSocket;
+import javax.net.ssl.*;
 import org.mariadb.jdbc.Configuration;
 import org.mariadb.jdbc.HostAddress;
 import org.mariadb.jdbc.ServerPreparedStatement;
@@ -33,17 +38,24 @@ import org.mariadb.jdbc.client.result.StreamingResult;
 import org.mariadb.jdbc.client.socket.Reader;
 import org.mariadb.jdbc.client.socket.Writer;
 import org.mariadb.jdbc.client.socket.impl.*;
+import org.mariadb.jdbc.client.tls.MariaDbX509EphemeralTrustingManager;
 import org.mariadb.jdbc.client.util.MutableByte;
 import org.mariadb.jdbc.export.ExceptionFactory;
 import org.mariadb.jdbc.export.MaxAllowedPacketException;
 import org.mariadb.jdbc.export.Prepare;
+import org.mariadb.jdbc.export.SslMode;
 import org.mariadb.jdbc.message.ClientMessage;
 import org.mariadb.jdbc.message.client.*;
 import org.mariadb.jdbc.message.server.ErrorPacket;
 import org.mariadb.jdbc.message.server.InitialHandshakePacket;
 import org.mariadb.jdbc.message.server.PrepareResultPacket;
+import org.mariadb.jdbc.plugin.AuthenticationPlugin;
 import org.mariadb.jdbc.plugin.Credential;
 import org.mariadb.jdbc.plugin.CredentialPlugin;
+import org.mariadb.jdbc.plugin.TlsSocketPlugin;
+import org.mariadb.jdbc.plugin.authentication.addon.ClearPasswordPlugin;
+import org.mariadb.jdbc.plugin.authentication.standard.NativePasswordPlugin;
+import org.mariadb.jdbc.plugin.tls.TlsSocketPluginLoader;
 import org.mariadb.jdbc.util.Security;
 import org.mariadb.jdbc.util.constants.Capabilities;
 import org.mariadb.jdbc.util.constants.ServerStatus;
@@ -58,9 +70,11 @@ public class StandardClient implements Client, AutoCloseable {
   private final MutableByte compressionSequence = new MutableByte();
   private final ReentrantLock lock;
   private final Configuration conf;
+  private AuthenticationPlugin authPlugin;
   private final HostAddress hostAddress;
   private boolean closed = false;
   private Reader reader;
+  private byte[] certFingerprint = null;
   private org.mariadb.jdbc.Statement streamStmt = null;
   private ClientMessage streamMsg = null;
   private int socketTimeout;
@@ -151,7 +165,7 @@ public class StandardClient implements Client, AutoCloseable {
       // changing to SSL socket if needed
       // **********************************************************************
       SSLSocket sslSocket =
-          ConnectionHelper.sslWrapper(
+          sslWrapper(
               hostAddress,
               socket,
               clientCapabilities,
@@ -187,9 +201,15 @@ public class StandardClient implements Client, AutoCloseable {
               clientCapabilities,
               (byte) handshake.getDefaultCollation())
           .encode(writer, context);
+      authPlugin =
+          "mysql_clear_password".equals(authenticationPluginType)
+              ? new ClearPasswordPlugin()
+              : new NativePasswordPlugin();
       writer.flush();
 
-      ConnectionHelper.authenticationHandler(credential, writer, reader, context);
+      authPlugin =
+          ConnectionHelper.authenticationHandler(
+              authPlugin, credential, writer, reader, context, certFingerprint);
 
       // **********************************************************************
       // activate compression if required
@@ -225,6 +245,94 @@ public class StandardClient implements Client, AutoCloseable {
       destroySocket();
       throw sqlException;
     }
+  }
+
+  /**
+   * Create SSL wrapper
+   *
+   * @param hostAddress host
+   * @param socket socket
+   * @param clientCapabilities client capabilities
+   * @param exchangeCharset connection charset
+   * @param context connection context
+   * @param writer socket writer
+   * @return SSLsocket
+   * @throws IOException if any socket error occurs
+   * @throws SQLException for any other kind of error
+   */
+  public SSLSocket sslWrapper(
+      final HostAddress hostAddress,
+      final Socket socket,
+      long clientCapabilities,
+      final byte exchangeCharset,
+      Context context,
+      Writer writer)
+      throws IOException, SQLException {
+
+    Configuration conf = context.getConf();
+    if (conf.sslMode() != SslMode.DISABLE) {
+
+      if (!context.hasServerCapability(Capabilities.SSL)) {
+        throw context
+            .getExceptionFactory()
+            .create("Trying to connect with ssl, but ssl not enabled in the server", "08000");
+      }
+
+      clientCapabilities |= Capabilities.SSL;
+      SslRequestPacket.create(clientCapabilities, exchangeCharset).encode(writer, context);
+
+      TlsSocketPlugin socketPlugin = TlsSocketPluginLoader.get(conf.tlsSocketType());
+      SSLSocketFactory sslSocketFactory;
+      TrustManager[] trustManagers =
+          socketPlugin.getTrustManager(conf, context.getExceptionFactory());
+      try {
+        SSLContext sslContext = SSLContext.getInstance("TLS");
+        sslContext.init(
+            socketPlugin.getKeyManager(conf, context.getExceptionFactory()), trustManagers, null);
+        sslSocketFactory = sslContext.getSocketFactory();
+      } catch (KeyManagementException keyManagementEx) {
+        throw context
+            .getExceptionFactory()
+            .create("Could not initialize SSL context", "08000", keyManagementEx);
+      } catch (NoSuchAlgorithmException noSuchAlgorithmEx) {
+        throw context
+            .getExceptionFactory()
+            .create("SSLContext TLS Algorithm not unknown", "08000", noSuchAlgorithmEx);
+      }
+      SSLSocket sslSocket = socketPlugin.createSocket(socket, sslSocketFactory);
+
+      enabledSslProtocolSuites(sslSocket, conf);
+      enabledSslCipherSuites(sslSocket, conf);
+
+      sslSocket.setUseClientMode(true);
+      sslSocket.startHandshake();
+      if (trustManagers.length > 0
+          && trustManagers[0] instanceof MariaDbX509EphemeralTrustingManager) {
+        certFingerprint = ((MariaDbX509EphemeralTrustingManager) trustManagers[0]).getFingerprint();
+      }
+
+      // perform hostname verification
+      // (rfc2818 indicate that if "client has external information as to the expected identity of
+      // the server, the hostname check MAY be omitted")
+      if (conf.sslMode() == SslMode.VERIFY_FULL && hostAddress != null) {
+
+        SSLSession session = sslSocket.getSession();
+        try {
+          socketPlugin.verify(hostAddress.host, session, context.getThreadId());
+        } catch (SSLException ex) {
+          throw context
+              .getExceptionFactory()
+              .create(
+                  "SSL hostname verification failed : "
+                      + ex.getMessage()
+                      + "\nThis verification can be disabled using the sslMode to VERIFY_CA "
+                      + "but won't prevent man-in-the-middle attacks anymore",
+                  "08006");
+        }
+      }
+      return sslSocket;
+    }
+    return null;
   }
 
   private void assignStream(OutputStream out, InputStream in, Configuration conf, Long threadId) {

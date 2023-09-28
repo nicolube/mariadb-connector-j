@@ -8,15 +8,15 @@ import java.io.IOException;
 import java.lang.reflect.Constructor;
 import java.net.InetSocketAddress;
 import java.net.Socket;
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.sql.SQLException;
 import java.sql.SQLNonTransientConnectionException;
 import java.util.Arrays;
 import java.util.List;
 import javax.net.SocketFactory;
-import javax.net.ssl.SSLException;
-import javax.net.ssl.SSLSession;
-import javax.net.ssl.SSLSocket;
-import javax.net.ssl.SSLSocketFactory;
+import javax.net.ssl.*;
 import org.mariadb.jdbc.Configuration;
 import org.mariadb.jdbc.HostAddress;
 import org.mariadb.jdbc.client.Context;
@@ -27,17 +27,15 @@ import org.mariadb.jdbc.client.socket.Writer;
 import org.mariadb.jdbc.client.socket.impl.SocketHandlerFunction;
 import org.mariadb.jdbc.client.socket.impl.SocketUtility;
 import org.mariadb.jdbc.export.SslMode;
-import org.mariadb.jdbc.message.client.SslRequestPacket;
 import org.mariadb.jdbc.message.server.AuthSwitchPacket;
 import org.mariadb.jdbc.message.server.ErrorPacket;
 import org.mariadb.jdbc.message.server.OkPacket;
 import org.mariadb.jdbc.plugin.AuthenticationPlugin;
 import org.mariadb.jdbc.plugin.Credential;
 import org.mariadb.jdbc.plugin.CredentialPlugin;
-import org.mariadb.jdbc.plugin.TlsSocketPlugin;
 import org.mariadb.jdbc.plugin.authentication.AuthenticationPluginLoader;
-import org.mariadb.jdbc.plugin.tls.TlsSocketPluginLoader;
 import org.mariadb.jdbc.util.ConfigurableSocketFactory;
+import org.mariadb.jdbc.util.StringUtils;
 import org.mariadb.jdbc.util.constants.Capabilities;
 
 /** Connection creation helper class */
@@ -224,17 +222,23 @@ public final class ConnectionHelper {
   }
 
   /**
-   * Authentication swtich handler
-   *
+   * @param authPlugin current authentication plugin
    * @param credential credential
    * @param writer socket writer
    * @param reader socket reader
    * @param context connection context
+   * @param certFingerprint certificate thumprint
+   * @return authPlugin (might have changed)
    * @throws IOException if any socket error occurs
    * @throws SQLException if any other kind of issue occurs
    */
-  public static void authenticationHandler(
-      Credential credential, Writer writer, Reader reader, Context context)
+  public static AuthenticationPlugin authenticationHandler(
+      AuthenticationPlugin authPlugin,
+      Credential credential,
+      Writer writer,
+      Reader reader,
+      Context context,
+      byte[] certFingerprint)
       throws IOException, SQLException {
 
     writer.permitTrace(true);
@@ -250,12 +254,10 @@ public final class ConnectionHelper {
           // https://mariadb.com/kb/en/library/connection/#authentication-switch-request
           // *************************************************************************************
           AuthSwitchPacket authSwitchPacket = AuthSwitchPacket.decode(buf);
-          AuthenticationPlugin authenticationPlugin =
-              AuthenticationPluginLoader.get(authSwitchPacket.getPlugin(), conf);
+          authPlugin = AuthenticationPluginLoader.get(authSwitchPacket.getPlugin(), conf);
 
-          authenticationPlugin.initialize(
-              credential.getPassword(), authSwitchPacket.getSeed(), conf);
-          buf = authenticationPlugin.process(writer, reader, context);
+          authPlugin.initialize(credential.getPassword(), authSwitchPacket.getSeed(), conf);
+          buf = authPlugin.process(writer, reader, context);
           break;
 
         case 0xFF:
@@ -274,7 +276,25 @@ public final class ConnectionHelper {
           // OK_Packet -> Authenticated !
           // see https://mariadb.com/kb/en/library/ok_packet/
           // *************************************************************************************
-          new OkPacket(buf, context);
+          OkPacket okPacket = new OkPacket(buf, context);
+          if (certFingerprint != null) {
+            // TLS was forced to trust, but set to SslMode.SslMode.VERIFY_CA, need to ensure server
+            // certificates
+            if (!authPlugin.permitHash()
+                || credential.getPassword() == null
+                || credential.getPassword().isEmpty()) {
+              throw context
+                  .getExceptionFactory()
+                  .create(
+                      "Self signed certificates. Either set sslMode=trust or set a password or provide server certificate to client",
+                      "08000");
+            }
+
+            if (!validateFingerPrint(
+                authPlugin, okPacket.getInfo(), certFingerprint, credential, context.getSeed())) {
+              throw context.getExceptionFactory().create("Self signed certificates", "08000");
+            }
+          }
           break authentication_loop;
 
         default:
@@ -286,6 +306,44 @@ public final class ConnectionHelper {
       }
     }
     writer.permitTrace(true);
+    return authPlugin;
+  }
+
+  private static boolean validateFingerPrint(
+      AuthenticationPlugin authPlugin,
+      byte[] validationHash,
+      byte[] fingerPrint,
+      Credential credential,
+      final byte[] seed) {
+    try {
+      assert (validationHash[0] == 0x01); // SHA256 encryption
+
+      byte[] hash = authPlugin.hash(credential);
+
+      final MessageDigest messageDigest = MessageDigest.getInstance("SHA-256");
+      messageDigest.update(hash);
+      messageDigest.update(seed);
+      messageDigest.update(fingerPrint);
+
+      final byte[] digest = messageDigest.digest();
+      final String hashHex = StringUtils.byteArrayToHexString(digest);
+      final String serverValidationHex =
+          new String(validationHash, 1, validationHash.length - 1, StandardCharsets.US_ASCII);
+      return hashHex.equals(serverValidationHex);
+
+    } catch (NoSuchAlgorithmException e) {
+      throw new RuntimeException("Could not use SHA-1, failing", e);
+    }
+  }
+
+  public static byte[] hexStringToByteArray(String s) {
+    int len = s.length();
+    byte[] data = new byte[len / 2];
+    for (int i = 0; i < len; i += 2) {
+      data[i / 2] =
+          (byte) ((Character.digit(s.charAt(i), 16) << 4) + Character.digit(s.charAt(i + 1), 16));
+    }
+    return data;
   }
 
   /**
@@ -304,75 +362,6 @@ public final class ConnectionHelper {
       return credentialPlugin.initialize(configuration, configuration.user(), hostAddress).get();
     }
     return new Credential(configuration.user(), configuration.password());
-  }
-
-  /**
-   * Create SSL wrapper
-   *
-   * @param hostAddress host
-   * @param socket socket
-   * @param clientCapabilities client capabilities
-   * @param exchangeCharset connection charset
-   * @param context connection context
-   * @param writer socket writer
-   * @return SSLsocket
-   * @throws IOException if any socket error occurs
-   * @throws SQLException for any other kind of error
-   */
-  public static SSLSocket sslWrapper(
-      final HostAddress hostAddress,
-      final Socket socket,
-      long clientCapabilities,
-      final byte exchangeCharset,
-      Context context,
-      Writer writer)
-      throws IOException, SQLException {
-
-    Configuration conf = context.getConf();
-    if (conf.sslMode() != SslMode.DISABLE) {
-
-      if (!context.hasServerCapability(Capabilities.SSL)) {
-        throw context
-            .getExceptionFactory()
-            .create("Trying to connect with ssl, but ssl not enabled in the server", "08000");
-      }
-
-      clientCapabilities |= Capabilities.SSL;
-      SslRequestPacket.create(clientCapabilities, exchangeCharset).encode(writer, context);
-
-      TlsSocketPlugin socketPlugin = TlsSocketPluginLoader.get(conf.tlsSocketType());
-      SSLSocketFactory sslSocketFactory =
-          socketPlugin.getSocketFactory(conf, context.getExceptionFactory());
-      SSLSocket sslSocket = socketPlugin.createSocket(socket, sslSocketFactory);
-
-      enabledSslProtocolSuites(sslSocket, conf);
-      enabledSslCipherSuites(sslSocket, conf);
-
-      sslSocket.setUseClientMode(true);
-      sslSocket.startHandshake();
-
-      // perform hostname verification
-      // (rfc2818 indicate that if "client has external information as to the expected identity of
-      // the server, the hostname check MAY be omitted")
-      if (conf.sslMode() == SslMode.VERIFY_FULL && hostAddress != null) {
-
-        SSLSession session = sslSocket.getSession();
-        try {
-          socketPlugin.verify(hostAddress.host, session, context.getThreadId());
-        } catch (SSLException ex) {
-          throw context
-              .getExceptionFactory()
-              .create(
-                  "SSL hostname verification failed : "
-                      + ex.getMessage()
-                      + "\nThis verification can be disabled using the sslMode to VERIFY_CA "
-                      + "but won't prevent man-in-the-middle attacks anymore",
-                  "08006");
-        }
-      }
-      return sslSocket;
-    }
-    return null;
   }
 
   /**

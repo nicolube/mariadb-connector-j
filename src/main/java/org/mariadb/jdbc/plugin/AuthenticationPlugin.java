@@ -43,4 +43,23 @@ public interface AuthenticationPlugin {
    */
   ReadableByteBuf process(Writer encoder, Reader decoder, Context context)
       throws IOException, SQLException;
+
+  /**
+   * Can plugins return HASH
+   *
+   * @return true if permitted
+   */
+  default boolean permitHash() {
+    return false;
+  }
+
+  /**
+   * Return Hash
+   *
+   * @param credential credential
+   * @return hash
+   */
+  default byte[] hash(Credential credential) {
+    return null;
+  }
 }
