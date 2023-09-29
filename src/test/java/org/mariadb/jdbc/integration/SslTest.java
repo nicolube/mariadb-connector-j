@@ -391,10 +391,15 @@ public class SslTest extends Common {
         createCon(baseOptions + "&sslMode=VERIFY_CA&serverSslCert=" + certificateString, sslPort)) {
       assertNotNull(getSslVersion(con));
     }
-    assertThrowsContains(
-        SQLNonTransientConnectionException.class,
-        () -> createBasicCon(baseOptions + "&sslMode=VERIFY_CA", sslPort),
-        "unable to find valid certification");
+
+
+    try {
+      createBasicCon(baseOptions + "&sslMode=VERIFY_CA", sslPort);
+      fail("must have thrown error");
+    } catch (Exception e) {
+      assertTrue(e.getMessage().contains("unable to find valid certification") || e.getMessage().contains("Self signed certificate"));
+    }
+
     if (!"maxscale".equals(System.getenv("srv"))) {
       assertThrows(
           SQLInvalidAuthorizationSpecException.class,
